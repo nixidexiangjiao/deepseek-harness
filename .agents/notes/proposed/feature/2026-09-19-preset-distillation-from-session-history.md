@@ -6,94 +6,124 @@ English | [中文](2026-09-19-preset-distillation-from-session-history.zh.md)
 
 ## Problem
 
-Every preset is written by hand, while the evidence of what a preset should contain is already recorded and unread.
+In one sentence: an agent's configuration is written by hand, although the sessions it has already run record what that configuration should say — and this note proposes reading that record, proposing a change from it, and writing the change only after a human accepts it.
+
+### Terms used in this note
+
+| Term | What it means here |
+|---|---|
+| DSH | DeepSeek Harness, this repository. Every package is named `@deepseek-ai/dsh-<name>`. |
+| session | One conversation between a user and an agent, from start to end. Each session writes a log. |
+| session log | The durable record of one session: every model request, tool call, tool result, and user message. |
+| transcript | The text inside a session log. It contains whatever the user and the tools produced, so it is not trusted input. |
+| plugin | One unit of behavior that can be switched on. A tool, a prompt section, and a skill provider are each plugins. |
+| mount | To switch a plugin on for a given agent, so its registrations take effect. |
+| preset | The configuration one agent session runs under. On disk it is a directory. |
+| composition | The file `agent.cordis.yml` inside a preset directory, listing which plugins that preset mounts. |
+| roster | The list of presets that [`dsh-agent-presets`](../../../../packages/preset/agent-presets/README.md) discovers, mounts, and can delete. |
+| authoring | Creating or deleting a preset through the roster, as opposed to editing files by hand. |
+| prompt section | A block of text added to the agent's system prompt, registered by [`dsh-persona`](../../../../packages/preset/persona/README.md). |
+| skill | A file of task-specific instructions the agent can load on demand, discovered by [`dsh-skill-filesystem`](../../../../packages/skill/skill-filesystem/README.md). |
+| base preset | The existing preset a distillation starts from. A human names it; the distiller never picks it. |
+| patch | The set of changes this proposal would apply on top of a base preset. |
+| capability floor | The rule limiting what a patch may contain. Defined under *The capability floor* below. |
+| RSIH | RSI-Harness, a separate project solving the same configuration problem for a different agent. Referenced only under *Alternatives considered* below. |
+
+### Functions named in this note
+
+| Call | Owner | What it does |
+|---|---|---|
+| `listSessions()`, `filterEvents()`, `searchEvents()` | [`dsh-session-query`](../../../../packages/session-query/session-query/README.md) | Read session history without loading whole logs. |
+| `readSession()` | `dsh-session-query` | Read one session log in full. |
+| `copy(from, id, name)` | `dsh-agent-presets` | Copy an existing preset directory to a new id. The only write that creates a preset today. |
+| `remove(id)` | `dsh-agent-presets` | Delete a locally authored preset. |
+| `compositionInventory()` | `dsh-agent-presets` | Report which plugins each preset's composition mounts. |
 
 ### How a preset works today
 
-A **preset** is the configuration one agent session runs under. It is a directory whose `agent.cordis.yml` — its **composition** — names the plugins to mount: tools, prompt sections, and skills. [`dsh-agent-presets`](../../../../packages/preset/agent-presets/README.md) discovers presets from three roots, mounts one standing composition per preset, and lists a preset whose composition cannot load with the reason instead of hiding it.
-
 ```text
-one session ──runs under──► preset ──────► composition (agent.cordis.yml)
-                            (a directory)        │
-                                                 └── mounts plugins:
-                                                     tools, prompt sections, skills
+   session  ────►  preset  ────►  agent.cordis.yml  ────►  plugin  plugin  plugin
+      ①              ②                   ③                        ④
 ```
 
-Meanwhile every session writes a log. [`dsh-session-query`](../../../../packages/session-query/session-query/README.md) can already list, filter, read, and search those logs, so the record of which tools were called, which shell commands recurred, which files were read repeatedly, and where the user corrected the agent is available to application code today.
+| Mark | Element | Note |
+|---|---|---|
+| ① | session | Runs under exactly one preset, named explicitly or taken from the configured default. |
+| ② | preset | A directory. The roster finds it in one of three roots and mounts one standing composition per preset. |
+| ③ | composition | Lists the plugins to mount. A preset whose composition cannot load is listed with the reason rather than hidden. |
+| ④ | plugins | Tools, prompt sections, and skills. What the agent can do is exactly what is mounted here. |
 
-Nothing reads that record to answer the question the preset answers: what should this agent be configured as.
+Every session also writes a log, and `dsh-session-query` can already list, filter, read, and search those logs. The record of which tools were called, which shell commands recurred, which files were read repeatedly, and where the user corrected the agent is therefore available to application code today.
+
+Nothing reads that record to answer the question a preset answers: what should this agent be configured as.
 
 ### Why the obvious fix is blocked
 
-The gap is not a missing store. It is that the only way to author a preset is to copy an existing one whole.
+The gap is not a missing store. It is that the only way to author a preset is `copy()` — a whole-directory copy of an existing one.
 
-[The authoring module](../../../../packages/preset/agent-presets/src/authoring.ts) accepts preset ids and an optional display name, never composition text, and it says why: authoring must grant no capability the copied preset did not already carry. A caller that could supply composition text could name any plugin, so accepting text would turn preset authoring into a way to mount anything.
+[The authoring module](../../../../packages/preset/agent-presets/src/authoring.ts) accepts preset ids and an optional display name, never composition text, and states why: authoring must grant no capability the copied preset did not already carry. A caller that could supply composition text could name any plugin, so accepting text would turn preset authoring into a way to mount anything.
 
 Personalization therefore ends in hand-editing `agent.cordis.yml` after the copy. No record survives of which observation justified which line, and a second person has nothing to audit.
 
 ## Proposal
 
-A distiller that reads session history, reduces it to counts, proposes a patch against a **base preset** the human names, and writes only after the human accepts — under one rule that keeps the authoring guarantee intact.
+A distiller that reads session history, reduces it to counts, proposes a patch against a base preset the human names, and writes only after the human accepts — under one rule, the capability floor, that keeps the authoring guarantee intact.
 
 ### The five stages
 
-The five stages are scan, profile, propose, confirm, and write; only the last one touches disk.
-
 ```text
- ① scan              ② profile           ③ propose          ④ confirm         ⑤ write
- ─────────           ─────────           ─────────          ─────────         ───────
- session history     counts, not         a patch, plus      a human reads     copy(base, id)
- read through   ──►  transcripts:   ──►  the observations ──►  it and      ──► then apply
- dsh-session-query   tool histograms,    behind every       accepts or        the patch
-                     recurring commands, proposed line      declines
-                     hot files,               ▲                                    │
-                     repeated corrections     │                                    ▼
-                                         base preset,                        an ordinary
-                                         named by the human                  preset directory
+   ┌────┐    ┌────┐    ┌────┐    ┌────┐    ┌────┐
+   │ ①  │───►│ ②  │───►│ ③  │───►│ ④  │───►│ ⑤  │
+   └────┘    └────┘    └────┘    └────┘    └────┘
+                                    │
+                                    └───► ✗ ───► ∅
 ```
 
-Stage ⑤ produces nothing special: the result is discovered, mounted, listed, and deleted by the existing roster with no new lifecycle.
+| Stage | Name | What happens | Reads or writes |
+|---|---|---|---|
+| ① | scan | Read session history through `dsh-session-query`. | reads logs |
+| ② | profile | Reduce it to counts: tool-call histograms, recurring shell commands, hot files, repeated user corrections. | in memory |
+| ③ | propose | Build a patch against the base preset, with the observations behind every proposed line attached. | in memory |
+| ④ | confirm | A human reads the patch and its evidence, then accepts or declines. | nothing |
+| ⑤ | write | `copy(base, id)`, then apply the patch. | writes disk |
+| ✗ | decline | The human declines at ④. | nothing |
+| ∅ | — | No preset directory and no partial file are left behind. | — |
+
+Only stage ⑤ touches disk, and what it produces is an ordinary preset: discovered, mounted, listed, and deleted by the existing roster, with no new lifecycle.
 
 ### The capability floor
 
-This is the rule the rest of the design hangs on. A distilled preset may add instruction data and may narrow what already exists; it may not mount a plugin its base does not mount.
+This is the rule the rest of the design hangs on: a distilled preset may add instruction text and may narrow what already exists, but may not mount a plugin its base does not mount.
 
-```text
-          base preset's mounted plugin set
-          (computed by compositionInventory())
-                        │
-                        ▼
-   ┌──────────────────────────────────────────────────┐
-   │ the patch MAY                                    │
-   │   add prompt sections    → dsh-persona           │──► written
-   │   add file-backed skills → dsh-skill-filesystem  │
-   │   narrow the config of a tool the base mounts    │
-   ├──────────────────────────────────────────────────┤
-   │ the patch MAY NOT                                │──► refused at
-   │   mount any plugin the base does not mount       │    validation;
-   └──────────────────────────────────────────────────┘    nothing is written
-```
+| What the patch wants to do | Allowed | Through | Outcome |
+|---|---|---|---|
+| Add a prompt section | yes | `dsh-persona` | written |
+| Add a file-backed skill | yes | `dsh-skill-filesystem` | written |
+| Narrow the config of a tool the base already mounts | yes | the tool's own `Config` | written |
+| Mount a plugin the base does not mount | **no** | — | refused at validation, naming the plugin; nothing is written |
 
-Prompt sections and file-backed skills pass the floor because they are instruction text, not capability grants: [`dsh-skill-filesystem`](../../../../packages/skill/skill-filesystem/README.md) discovers skills as files under scanned roots, and [`dsh-persona`](../../../../packages/preset/persona/README.md) registers prompt sections. Neither mounts anything new.
+The base's mounted plugin set comes from `compositionInventory()`, so "does the base mount this" is a computed answer rather than a judgement.
 
-The floor is what preserves the authoring guarantee. Today that guarantee holds because composition text never comes from a caller. Under this proposal it holds because generated text is checked against the base's mounted plugin set before any write, so the result still grants nothing the base did not already carry.
+Prompt sections and file-backed skills pass the floor because they are instruction text, not capability grants: a skill is a file the agent may read, and a prompt section is text added to the system prompt. Neither mounts anything new.
+
+The floor is what preserves the authoring guarantee. Today the guarantee holds because composition text never comes from a caller. Under this proposal it holds because generated text is checked against the base's mounted plugin set before any write, so the result still grants nothing the base did not already carry.
 
 ### Where each part lives
 
 | Part | Home | Why there |
 |---|---|---|
 | Corpus scan, floor check, write | the plugin | The floor is the security-relevant half and must fail loud in code. |
-| Which pattern becomes a skill, a narrowed tool, or nothing | a skill the package ships | Classification rules stay readable and editable as instructions instead of compiled into `src/`. |
+| Which recurring pattern becomes a skill, a narrowed tool, or nothing | a skill the package ships | Classification rules stay readable and editable as instructions instead of compiled into `src/`. |
 
 ### A worked example
 
 A user runs the `standard` preset for three months on one repository.
 
-The scan counts 412 `bash` calls, of which 180 begin with `pytest`; 96 reads of `conftest.py`; and 14 turns whose next user message corrects the agent for running the whole suite instead of one file.
+Stage ② counts 412 `bash` calls, of which 180 begin with `pytest`; 96 reads of `conftest.py`; and 14 turns whose next user message corrects the agent for running the whole suite instead of one file.
 
-The distiller proposes one prompt section stating that this repository's tests run per file by default, and one skill recording how to select a test file. It proposes no tool changes, because no count supports one. Every proposed line is listed with the counts behind it.
+Stage ③ proposes one prompt section stating that this repository's tests run per file by default, and one skill recording how to select a test file. It proposes no tool change, because no count supports one. Every proposed line is listed with the counts behind it.
 
-The human accepts. The write is `copy('standard', 'py-repo')` followed by that patch. Nothing in the result mounts a plugin `standard` does not.
+The human accepts at ④. Stage ⑤ runs `copy('standard', 'py-repo')` and applies that patch. Nothing in the result mounts a plugin `standard` does not.
 
 ### Remaining mechanisms
 
@@ -107,7 +137,7 @@ Training-data extraction, routing signals, remote install of someone else's pres
 ## Alternatives considered
 
 - **Let the distiller write composition text directly:** rejected because it deletes the reason preset authoring is narrow. A caller that supplies composition text can mount any plugin, so a distiller misled by its own corpus — transcripts are text an attacker can reach — would become a capability-escalation path. The floor holds the worst case at "text the base could already produce".
-- **Adopt RSIH's twelve-component ownership model:** rejected. That partition earns its value against a flat `settings.json`, where field ownership must be imposed from outside. Our configuration is a plugin graph in which each plugin's `Config` already partitions ownership, and a second fixed taxonomy would compete with the package groups with no gate maintaining it.
+- **Adopt RSIH's twelve-component ownership model:** rejected. That partition earns its value against a flat `settings.json`, where field ownership must be imposed from outside. DSH configuration is a plugin graph in which each plugin's `Config` already partitions ownership, and a second fixed taxonomy would compete with the package groups with no gate maintaining it.
 - **Adopt RSIH's compiled settings:** rejected. Rewriting declared keys into one settings file at startup forces a single active profile per process. The roster mounts one standing composition per preset and parents agent scopes to it, so sessions on different presets already run concurrently with separate state; compiling settings would give that up.
 - **Ask the user what they want configured:** rejected as the path that already exists. The reason to read history is that stated preference and observed need diverge, and the observed side is the one no current view reports.
 - **Ship the whole distiller as a skill, with no plugin:** rejected because a skill can only advise the model to respect the floor, never enforce it.
@@ -118,13 +148,13 @@ Training-data extraction, routing signals, remote install of someone else's pres
 - Every proposed line is accompanied by the observations that justify it, and the confirmation artifact lists them; a field with no supporting observation is absent from the output rather than defaulted.
 - A run over a corpus of at least one thousand sessions issues no model request containing a whole session log.
 - The written preset passes the existing roster's discovery and mount path unchanged, and `remove()` deletes it like any locally authored preset.
-- Declining at the confirmation step leaves no preset directory and no partial write.
+- Declining at stage ④ leaves no preset directory and no partial write.
 - Unit tests cover the floor check (accepting a prompt, skill, or narrowing patch; refusing a plugin addition), the aggregate-first scan, and the copy-then-patch write. A keyless recorded-session snapshot covers one end-to-end distillation, because the artifact and the confirmation exchange are model-visible.
 
 ## Risks
 
-- **Private residue is a blocking precondition, not a follow-up.** Generated text is distilled from real transcripts and will carry absolute paths, internal hostnames, and material that looks like credentials. RSIH ships this gap knowingly and documents it; we should not. A redaction pass over generated text, with the residue shown at the confirmation step, belongs in the first landing.
+- **Private residue is a blocking precondition, not a follow-up.** Generated text is distilled from real transcripts and will carry absolute paths, internal hostnames, and material that looks like credentials. RSIH ships this gap knowingly and documents it; DSH should not. A redaction pass over generated text, with the residue shown at stage ④, belongs in the first landing.
 - **The floor depends on a computable base plugin set.** `compositionInventory()` supplies it, but a base preset may gate rows on the host — the shipped `minimal` preset disables rows by `process.platform` — so the mounted set is host-dependent. The floor is computed on the resolving host and re-checked at mount, and a base whose inventory cannot be resolved is refused rather than approximated.
 - **No gate asserts that a preset can express what the host composition can.** Presets carry tools, prompt sections, and skills; whether every configurable field is reachable from a preset is unchecked, so the distiller can only propose within whatever happens to be expressible. This proposal does not close that gap and will make it visible; closing it is a separate `process` decision.
 - **Evidence skews toward recent and heavy use.** A profile built over an unbounded window lets one intense week define the agent. The aggregation window and the minimum number of occurrences before a pattern counts are `Config` fields changeable from cordis.yml, not constants, per the rule against hardcoded tunables in plugins.
-- **A distilled preset is still trusted configuration.** The roster already requires treating every authored preset as trusted, because it grants the capabilities of the plugins it selects. The floor narrows what distillation can add; it does not make the result unreviewed, and the confirmation step is that review.
+- **A distilled preset is still trusted configuration.** The roster already requires treating every authored preset as trusted, because it grants the capabilities of the plugins it selects. The floor narrows what distillation can add; it does not make the result unreviewed, and stage ④ is that review.
