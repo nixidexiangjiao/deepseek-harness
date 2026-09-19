@@ -97,12 +97,15 @@ This is the rule the rest of the design hangs on: a distilled preset may add ins
 
 | What the patch wants to do | Allowed | Through | Outcome |
 |---|---|---|---|
-| Add a prompt section | yes | `dsh-persona` | written |
-| Add a file-backed skill | yes | `dsh-skill-filesystem` | written |
-| Narrow the config of a tool the base already mounts | yes | the tool's own `Config` | written |
+| Add a prompt section | yes | `dsh-persona` prefix and suffix | written |
+| Add a file-backed skill | yes | the preset's own `skills/` directory | written |
+| Narrow a mounted tool's own limits | yes | that tool's `Config` | written |
+| Change any other config field | **no** | — | refused at validation, naming the field |
 | Mount a plugin the base does not mount | **no** | — | refused at validation, naming the plugin; nothing is written |
 
 The base's mounted plugin set comes from `compositionInventory()`, so "does the base mount this" is a computed answer rather than a judgement.
+
+Permitted config edits are an explicit field allowlist, not "any field of an already-mounted plugin". A config field can widen behavior as surely as a new row, so the floor names the three it permits: `dsh-persona`'s `prefix` and `suffix`, the `customSkillDirs` entry that registers the preset's own bundled `skills/` directory, and a narrowing change to a mounted tool's own limits.
 
 Prompt sections and file-backed skills pass the floor because they are instruction text, not capability grants: a skill is a file the agent may read, and a prompt section is text added to the system prompt. Neither mounts anything new.
 
@@ -117,13 +120,94 @@ The floor is what preserves the authoring guarantee. Today the guarantee holds b
 
 ### A worked example
 
-A user runs the `standard` preset for three months on one repository.
+A user runs the shipped `standard` preset for three months on one Python repository. That preset already mounts `dsh-persona` and `dsh-skill-filesystem`, which is what makes the patch below legal.
 
-Stage ② counts 412 `bash` calls, of which 180 begin with `pytest`; 96 reads of `conftest.py`; and 14 turns whose next user message corrects the agent for running the whole suite instead of one file.
+Stages ① and ② read 143 sessions and reduce them to counts. Stage ③ turns those counts into this confirmation artifact, which is the whole of what stage ④ shows the human:
 
-Stage ③ proposes one prompt section stating that this repository's tests run per file by default, and one skill recording how to select a test file. It proposes no tool change, because no count supports one. Every proposed line is listed with the counts behind it.
+```text
+preset distillation · base: standard · new id: py-repo
+corpus: own store, 143 sessions, 2026-06-19 … 2026-09-19
 
-The human accepts at ④. Stage ⑤ runs `copy('standard', 'py-repo')` and applies that patch. Nothing in the result mounts a plugin `standard` does not.
+[1] persona.suffix                                    +1 sentence
+      Tests in this repository are run per file by default. Run the
+      whole suite only when asked.
+    evidence  180 of 412 bash calls begin `pytest`
+              14 user turns correct a whole-suite run
+
+[2] skills/select-test-target/SKILL.md                 new file
+    evidence  96 reads of conftest.py across 61 sessions
+              11 sessions re-derive the same file-selection steps
+
+[3] skill-filesystem.customSkillDirs                   +1 entry
+      <preset>/skills/
+    reason    required by [2]; allowlisted field, plugin already mounted
+
+not proposed: tools, model, runtime, policies, appearance
+              no observation reached the configured minimum of 8
+
+capability floor  OK · 0 plugins added · 3 allowlisted fields touched
+                  accept / decline ?
+```
+
+The human accepts, and stage ⑤ runs `copy('standard', 'py-repo')` then applies the patch, producing this directory:
+
+```text
+~/.dsh/.agent-presets/py-repo/
+├── preset.yml
+├── agent.cordis.yml
+└── skills/
+    └── select-test-target/
+        └── SKILL.md
+```
+
+Two rows of the copied `agent.cordis.yml` change, and both belong to plugins `standard` already mounts:
+
+```diff
+ - id: persona
+   name: '@deepseek-ai/dsh-persona'
+   config:
+-    suffix: Your working directory is {{cwd}}.
++    suffix: >-
++      Your working directory is {{cwd}}.
++      Tests in this repository are run per file by default. Run the whole
++      suite only when asked.
+     prefix: >-
+       You are a coding agent powered by the {{model}} model.
+
+ - id: skill-filesystem
+   name: '@deepseek-ai/dsh-skill-filesystem'
++  config:
++    customSkillDirs:
++      - !!js "process.getBuiltinModule('node:url').fileURLToPath(new URL('skills/', baseUrl))"
+```
+
+The one new file is an ordinary skill bundle:
+
+```markdown
+---
+name: select-test-target
+description: Use when running tests in this repository, to choose which test file to run instead of the whole suite.
+---
+
+# Selecting a test target
+
+Run one file with `pytest <path>`; run the whole suite only when asked.
+
+To find the file for a change, locate the nearest `conftest.py` and the test module importing the changed module.
+```
+
+Had the same corpus also produced a proposal to mount a plugin — seven sessions asking about plugin internals might suggest `@deepseek-ai/dsh-tool-cordis`, which the `cordis` preset mounts and `standard` does not — the floor refuses it and the run writes nothing:
+
+```text
+[4] + plugin row '@deepseek-ai/dsh-tool-cordis'
+    evidence  7 sessions ask about plugin internals
+
+capability floor  REFUSED
+  '@deepseek-ai/dsh-tool-cordis' is not mounted by base preset 'standard'
+  nothing was written
+```
+
+Distillation cannot resolve that request; a human moves to a base preset that already mounts the plugin, or declines.
 
 ### Remaining mechanisms
 

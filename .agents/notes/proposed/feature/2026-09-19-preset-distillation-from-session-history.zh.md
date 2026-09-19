@@ -97,12 +97,15 @@ Status: proposed
 
 | patch 想做的事 | 是否允许 | 经由 | 结果 |
 |---|---|---|---|
-| 追加一个 prompt section | 允许 | `dsh-persona` | 写入 |
-| 追加一个文件型 skill | 允许 | `dsh-skill-filesystem` | 写入 |
-| 收窄基准已挂载工具的配置 | 允许 | 该工具自己的 `Config` | 写入 |
+| 追加一个 prompt section | 允许 | `dsh-persona` 的 prefix 与 suffix | 写入 |
+| 追加一个文件型 skill | 允许 | 该 preset 自带的 `skills/` 目录 | 写入 |
+| 收窄某个已挂载工具自身的限额 | 允许 | 该工具的 `Config` | 写入 |
+| 改动其他任何配置字段 | **不允许** | — | 校验期拒绝并点名该字段 |
 | 挂载一个基准未挂载的插件 | **不允许** | — | 校验期拒绝并点名该插件，不写入任何文件 |
 
 基准的已挂载插件集来自 `compositionInventory()`，因此"基准是否挂载了这个"是算出来的答案，而不是一次判断。
+
+被允许的配置改动是一份**显式字段白名单**，而不是"已挂载插件的任意字段"。一个配置字段同样能扩大行为，其程度不亚于新增一行，因此下界点名它允许的三处：`dsh-persona` 的 `prefix` 与 `suffix`、用于注册该 preset 自带 `skills/` 目录的那条 `customSkillDirs`、以及对某个已挂载工具自身限额的收窄改动。
 
 prompt section 和文件型 skill 能通过下界，是因为它们是指令文本而非能力授予：skill 是一个 agent 可以去读的文件，prompt section 是加进系统提示词的文本。两者都不挂载任何新东西。
 
@@ -117,13 +120,94 @@ prompt section 和文件型 skill 能通过下界，是因为它们是指令文�
 
 ### 一个走通的例子
 
-一位用户在同一个仓库上用 `standard` preset 工作了三个月。
+一位用户在同一个 Python 仓库上用随包发布的 `standard` preset 工作了三个月。该 preset 本就挂载了 `dsh-persona` 和 `dsh-skill-filesystem`，这正是下面这份 patch 合法的原因。
 
-阶段 ② 数出 412 次 `bash` 调用，其中 180 次以 `pytest` 开头；96 次读取 `conftest.py`；以及 14 个轮次，其下一条用户消息在纠正 agent 跑了整个测试套件而不是单个文件。
+阶段 ① 与 ② 读入 143 个会话并把它们归约为计数。阶段 ③ 把这些计数变成下面这份确认产物——它就是阶段 ④ 给人看的全部内容：
 
-阶段 ③ 提议追加一个 prompt section，说明该仓库的测试默认按文件运行；再追加一个 skill，记录如何选定测试文件。它不提议任何工具改动，因为没有计数支撑。每一条提议都连同其背后的计数一并列出。
+```text
+preset distillation · base: standard · new id: py-repo
+corpus: own store, 143 sessions, 2026-06-19 … 2026-09-19
 
-人工在 ④ 接受。阶段 ⑤ 执行 `copy('standard', 'py-repo')` 并施加该 patch。结果中没有任何东西挂载了 `standard` 所没有的插件。
+[1] persona.suffix                                    +1 sentence
+      Tests in this repository are run per file by default. Run the
+      whole suite only when asked.
+    evidence  180 of 412 bash calls begin `pytest`
+              14 user turns correct a whole-suite run
+
+[2] skills/select-test-target/SKILL.md                 new file
+    evidence  96 reads of conftest.py across 61 sessions
+              11 sessions re-derive the same file-selection steps
+
+[3] skill-filesystem.customSkillDirs                   +1 entry
+      <preset>/skills/
+    reason    required by [2]; allowlisted field, plugin already mounted
+
+not proposed: tools, model, runtime, policies, appearance
+              no observation reached the configured minimum of 8
+
+capability floor  OK · 0 plugins added · 3 allowlisted fields touched
+                  accept / decline ?
+```
+
+人工接受，阶段 ⑤ 执行 `copy('standard', 'py-repo')` 再施加该 patch，产出这样一个目录：
+
+```text
+~/.dsh/.agent-presets/py-repo/
+├── preset.yml
+├── agent.cordis.yml
+└── skills/
+    └── select-test-target/
+        └── SKILL.md
+```
+
+被复制的 `agent.cordis.yml` 里有两行发生改动，且两者都属于 `standard` 本就挂载的插件：
+
+```diff
+ - id: persona
+   name: '@deepseek-ai/dsh-persona'
+   config:
+-    suffix: Your working directory is {{cwd}}.
++    suffix: >-
++      Your working directory is {{cwd}}.
++      Tests in this repository are run per file by default. Run the whole
++      suite only when asked.
+     prefix: >-
+       You are a coding agent powered by the {{model}} model.
+
+ - id: skill-filesystem
+   name: '@deepseek-ai/dsh-skill-filesystem'
++  config:
++    customSkillDirs:
++      - !!js "process.getBuiltinModule('node:url').fileURLToPath(new URL('skills/', baseUrl))"
+```
+
+唯一新增的文件是一个普通的 skill bundle：
+
+```markdown
+---
+name: select-test-target
+description: Use when running tests in this repository, to choose which test file to run instead of the whole suite.
+---
+
+# Selecting a test target
+
+Run one file with `pytest <path>`; run the whole suite only when asked.
+
+To find the file for a change, locate the nearest `conftest.py` and the test module importing the changed module.
+```
+
+假如同一份语料还产生了一条"挂载某个插件"的提议——七个会话在问插件内部机制，可能指向 `cordis` preset 挂载而 `standard` 没有的 `@deepseek-ai/dsh-tool-cordis`——下界会拒绝它，且该次运行什么都不写：
+
+```text
+[4] + plugin row '@deepseek-ai/dsh-tool-cordis'
+    evidence  7 sessions ask about plugin internals
+
+capability floor  REFUSED
+  '@deepseek-ai/dsh-tool-cordis' is not mounted by base preset 'standard'
+  nothing was written
+```
+
+蒸馏解决不了这个诉求；人工要么换一个本就挂载该插件的基准 preset，要么放弃。
 
 ### 其余机制
 
