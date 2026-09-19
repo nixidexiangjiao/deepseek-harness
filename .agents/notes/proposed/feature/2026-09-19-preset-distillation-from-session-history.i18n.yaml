@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/proposed/feature/2026-09-19-preset-distillation-from-session-history.md
-2026-09-19-preset-distillation-from-session-history.md: 786b17b9a3acc07eab6f8cd231f100bac6bdc9a0
-2026-09-19-preset-distillation-from-session-history.zh.md: 681f8c509d5602633d71d41e5dfc8df87c7e2702
+2026-09-19-preset-distillation-from-session-history.md: 289feff09ff15d2c808006c448f92b1f651aca45
+2026-09-19-preset-distillation-from-session-history.zh.md: bde01ff3e00383d13f952805ddb310436749a3a1
